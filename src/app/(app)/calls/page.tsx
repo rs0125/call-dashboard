@@ -2,7 +2,7 @@ import Link from "next/link";
 import {
   getCalls,
   getDistinctStatuses,
-  getEmployeeStats,
+  getEmployeeOptions,
   CALL_SORTS,
   type CallSort,
   type SortOrder,
@@ -38,7 +38,7 @@ export default async function CallsPage({
     await Promise.all([
       getCalls({ employeeId, direction, status, search, sort, order, page }),
       getDistinctStatuses(),
-      getEmployeeStats(),
+      getEmployeeOptions(),
     ]);
 
   // Preserve all non-page params when building links.

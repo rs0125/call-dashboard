@@ -50,13 +50,14 @@ export type EmployeeStat = {
   phoneNumber: string;
   email: string | null;
   active: boolean;
-  totalCalls: number; // calls the employee is involved in (either leg)
-  made: number; // employee is the `from` leg
-  received: number; // employee is the `to` leg
+  // All counts are attributed by the AGENT leg (see the function comment below):
+  // outbound calls the employee dialed + inbound calls they answered.
+  totalCalls: number;
   answered: number;
   talkSeconds: number;
   lastCallAt: Date | null;
-  // Per-direction breakdown of the employee's involved calls.
+  // Per-direction breakdown. outbound.total = calls made; inbound.total =
+  // calls received (these replace the former duplicate made/received fields).
   inbound: EmpDirStats;
   outbound: EmpDirStats;
 };
@@ -72,23 +73,30 @@ export type EmpDirStats = {
 //   inbound  -> the agent is the To leg (who answered)
 //   outbound -> the agent is the From leg (who dialed)
 // So a call is the employee's when (inbound AND they're To) OR (outbound AND
-// they're From). `made` = outbound calls they dialed; `received` = inbound
-// calls they answered. (The other party being an employee does NOT credit
-// them — e.g. the caller on an inbound call isn't the one who took it.)
+// they're From). outbound.total = calls they dialed; inbound.total = calls they
+// answered. (The other party being an employee does NOT credit them — e.g. the
+// caller on an inbound call isn't the one who took it.)
 //
 // withCallsOnly (default) drops employees with zero calls via a HAVING clause,
 // so the whole list comes back in a single query with no empty rows.
+// employeeId scopes the aggregation to one person (detail page).
 export async function getEmployeeStats(
   {
     withCallsOnly = true,
     since,
-  }: { withCallsOnly?: boolean; since?: Date } = {},
+    employeeId,
+  }: { withCallsOnly?: boolean; since?: Date; employeeId?: number } = {},
 ): Promise<EmployeeStat[]> {
   const having = withCallsOnly
     ? Prisma.sql`HAVING COUNT(c.id) > 0`
     : Prisma.empty;
   const sinceClause = since
     ? Prisma.sql`AND c.start_time >= ${since}`
+    : Prisma.empty;
+  // Scope the whole aggregation to one employee (detail page) instead of the
+  // entire fleet — avoids the per-employee LATERAL running for everyone.
+  const employeeClause = employeeId
+    ? Prisma.sql`WHERE e.id = ${employeeId}`
     : Prisma.empty;
   const rows = await prisma.$queryRaw<
     Array<{
@@ -98,8 +106,6 @@ export async function getEmployeeStats(
       email: string | null;
       is_active: boolean;
       total_calls: bigint;
-      made: bigint;
-      received: bigint;
       answered: bigint;
       talk_seconds: bigint;
       last_call_at: Date | null;
@@ -116,8 +122,6 @@ export async function getEmployeeStats(
       (SELECT phone_number FROM employee_numbers
         WHERE employee_id = e.id AND is_primary LIMIT 1)                          AS phone_number,
       COUNT(c.id)                                                                  AS total_calls,
-      COUNT(*) FILTER (WHERE c.dir_out)                                            AS made,
-      COUNT(*) FILTER (WHERE c.dir_in)                                             AS received,
       COUNT(*) FILTER (WHERE lower(c.status) IN ('completed','in-progress','in-call')) AS answered,
       COALESCE(SUM(c.conversation_duration), 0)                                    AS talk_seconds,
       MAX(c.start_time)                                                            AS last_call_at,
@@ -143,6 +147,7 @@ export async function getEmployeeStats(
             ${sinceClause}
             ${blockedCallClause()}
     ) c ON true
+    ${employeeClause}
     GROUP BY e.id
     ${having}
     ORDER BY total_calls DESC, e.name ASC
@@ -155,8 +160,6 @@ export async function getEmployeeStats(
     email: r.email,
     active: r.is_active,
     totalCalls: n(r.total_calls),
-    made: n(r.made),
-    received: n(r.received),
     answered: n(r.answered),
     talkSeconds: n(r.talk_seconds),
     lastCallAt: r.last_call_at,
@@ -251,8 +254,6 @@ export type Overview = {
   inbound: DirectionStats;
   outbound: DirectionStats;
   totalCalls: number;
-  totalEmployees: number;
-  activeEmployees: number;
   unmatchedCalls: number; // no employee on either leg
 };
 
@@ -261,10 +262,8 @@ export async function getOverview(since?: Date): Promise<Overview> {
     ? Prisma.sql`AND c.start_time >= ${since}`
     : Prisma.empty;
 
-  const [dir, employees, activeEmployees, unmatched] = await Promise.all([
+  const [dir, unmatched] = await Promise.all([
     getDirectionStats(since),
-    prisma.employees.count(),
-    prisma.employees.count({ where: { is_active: true } }),
     prisma.$queryRaw<Array<{ n: bigint }>>`
       SELECT COUNT(*) AS n
       FROM calls c
@@ -281,8 +280,6 @@ export async function getOverview(since?: Date): Promise<Overview> {
     inbound: dir.inbound,
     outbound: dir.outbound,
     totalCalls: dir.totalCalls,
-    totalEmployees: employees,
-    activeEmployees,
     unmatchedCalls: n(unmatched[0]?.n ?? 0),
   };
 }
@@ -343,7 +340,6 @@ type RawCallRow = {
   direction: string | null;
   status: string | null;
   start_time: Date | null;
-  duration: bigint | null;
   conversation_duration: bigint | null;
   recording_url: string | null;
   has_transcript: boolean;
@@ -408,7 +404,7 @@ export async function getCalls(filters: CallFilters = {}) {
     prisma.$queryRaw<RawCallRow[]>`
       SELECT
         c.id, c.exotel_sid, c.from_number, c.to_number, c.direction, c.status,
-        c.start_time, c.duration, c.conversation_duration, c.recording_url,
+        c.start_time, c.conversation_duration, c.recording_url,
         (c.transcript IS NOT NULL) AS has_transcript,
         ef.id AS from_emp_id, ef.name AS from_emp_name,
         et.id AS to_emp_id, et.name AS to_emp_name
@@ -426,8 +422,6 @@ export async function getCalls(filters: CallFilters = {}) {
     pageSize,
     total,
     totalPages: Math.max(Math.ceil(total / pageSize), 1),
-    sort,
-    order,
     calls: rows.map((c) => ({
       id: n(c.id),
       exotelSid: c.exotel_sid,
@@ -436,7 +430,6 @@ export async function getCalls(filters: CallFilters = {}) {
       direction: c.direction,
       status: c.status,
       startTime: c.start_time,
-      duration: n(c.duration),
       conversationDuration: n(c.conversation_duration),
       recordingUrl: c.recording_url,
       hasTranscript: c.has_transcript,
@@ -451,6 +444,19 @@ export async function getCalls(filters: CallFilters = {}) {
 }
 
 export type CallRow = Awaited<ReturnType<typeof getCalls>>["calls"][number];
+
+// Minimal employee list ({id, name}) for the calls-page filter dropdown — a
+// cheap indexed scan instead of the heavy per-employee aggregation. Lists ALL
+// employees (not just those with calls), so any agent can be filtered on.
+export async function getEmployeeOptions(): Promise<
+  Array<{ id: number; name: string }>
+> {
+  const rows = await prisma.employees.findMany({
+    select: { id: true, name: true },
+    orderBy: { name: "asc" },
+  });
+  return rows.map((e) => ({ id: n(e.id), name: e.name ?? "(unnamed)" }));
+}
 
 // Distinct statuses present in the data — powers the filter dropdown.
 export async function getDistinctStatuses(): Promise<string[]> {

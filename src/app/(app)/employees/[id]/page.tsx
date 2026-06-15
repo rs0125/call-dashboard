@@ -20,10 +20,11 @@ export default async function EmployeePage({
   if (!employee) notFound();
 
   const [stats, { calls, total }] = await Promise.all([
-    getEmployeeStats(),
+    // withCallsOnly:false so an employee with zero calls still returns a row.
+    getEmployeeStats({ employeeId: id, withCallsOnly: false }),
     getCalls({ employeeId: id, pageSize: 100 }),
   ]);
-  const stat = stats.find((s) => s.id === id);
+  const stat = stats[0];
 
   const answerRate =
     stat && stat.totalCalls
@@ -81,8 +82,8 @@ export default async function EmployeePage({
         }}
       >
         <StatCard label="Total calls" value={stat?.totalCalls ?? 0} />
-        <StatCard label="Made" value={stat?.made ?? 0} />
-        <StatCard label="Received" value={stat?.received ?? 0} />
+        <StatCard label="Made" value={stat?.outbound.total ?? 0} />
+        <StatCard label="Received" value={stat?.inbound.total ?? 0} />
         <StatCard
           label="Answered"
           value={stat?.answered ?? 0}
