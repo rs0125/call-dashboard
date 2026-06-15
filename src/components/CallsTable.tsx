@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { CallRow, CallSort, SortOrder } from "@/lib/queries";
 import { StatusBadge, DirectionBadge } from "./Badge";
 import { ConversationButton } from "./ConversationModal";
+import { RecordingPlayer } from "./RecordingPlayer";
 import { fmtDateTime, fmtDuration, directionLabel } from "@/lib/format";
 
 export type SortState = {
@@ -116,9 +117,7 @@ export function CallsTable({
               <td>
                 <div style={{ display: "flex", alignItems: "center", gap: "0.85rem" }}>
                   {c.recordingUrl ? (
-                    <a href={c.recordingUrl} target="_blank" rel="noopener noreferrer">
-                      ▶ play
-                    </a>
+                    <RecordingPlayer url={c.recordingUrl} />
                   ) : (
                     <span style={{ color: "var(--slate)" }}>—</span>
                   )}

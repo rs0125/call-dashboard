@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CallRow, CallTranscript } from "@/lib/queries";
+import { RecordingPlayer } from "./RecordingPlayer";
 import { fmtDateTime, fmtDuration, directionLabel } from "@/lib/format";
 
 // Eye-icon button that opens a modal with the call's conversation rendered as a
@@ -108,6 +109,17 @@ function ConversationModal({ call, onClose }: { call: CallRow; onClose: () => vo
             ✕
           </button>
         </div>
+
+        {call.recordingUrl ? (
+          <div
+            style={{
+              padding: "0.75rem 1.2rem",
+              borderBottom: "var(--stroke) solid var(--blue)",
+            }}
+          >
+            <RecordingPlayer url={call.recordingUrl} wide />
+          </div>
+        ) : null}
 
         <div className="conv-body">
           {loading ? <div className="conv-loading">Loading transcript…</div> : null}

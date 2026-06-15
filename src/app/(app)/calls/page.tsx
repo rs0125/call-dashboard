@@ -16,6 +16,16 @@ type SP = Record<string, string | string[] | undefined>;
 const one = (v: string | string[] | undefined) =>
   Array.isArray(v) ? v[0] : v;
 
+const DAY = 24 * 60 * 60 * 1000;
+
+// Parse a YYYY-MM-DD calendar date as the instant at IST (UTC+5:30) midnight.
+// Returns undefined for missing or malformed input (filter is skipped).
+function istDayStart(s: string | undefined): Date | undefined {
+  if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return undefined;
+  const d = new Date(`${s}T00:00:00+05:30`);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+}
+
 export default async function CallsPage({
   searchParams,
 }: {
@@ -28,6 +38,15 @@ export default async function CallsPage({
   const search = one(sp.q) || undefined;
   const page = Number(one(sp.page) || "1");
 
+  // Date range: from/to are YYYY-MM-DD calendar days interpreted at IST
+  // (matching the overview's IST day boundaries). `to` is inclusive of its whole
+  // day, so the SQL upper bound is the start of the following IST day (exclusive).
+  const fromStr = one(sp.from) || undefined;
+  const toStr = one(sp.to) || undefined;
+  const dateFrom = istDayStart(fromStr);
+  const toStart = istDayStart(toStr);
+  const dateUntil = toStart ? new Date(toStart.getTime() + DAY) : undefined;
+
   const sortParam = one(sp.sort);
   const sort: CallSort = CALL_SORTS.includes(sortParam as CallSort)
     ? (sortParam as CallSort)
@@ -36,7 +55,17 @@ export default async function CallsPage({
 
   const [{ calls, total, totalPages, pageSize }, statuses, employees] =
     await Promise.all([
-      getCalls({ employeeId, direction, status, search, sort, order, page }),
+      getCalls({
+        employeeId,
+        direction,
+        status,
+        search,
+        dateFrom,
+        dateUntil,
+        sort,
+        order,
+        page,
+      }),
       getDistinctStatuses(),
       getEmployeeOptions(),
     ]);
@@ -48,6 +77,8 @@ export default async function CallsPage({
     if (direction) p.set("direction", direction);
     if (status) p.set("status", status);
     if (search) p.set("q", search);
+    if (fromStr) p.set("from", fromStr);
+    if (toStr) p.set("to", toStr);
     if (sort !== "when") p.set("sort", sort);
     if (order !== "desc") p.set("order", order);
     return p;

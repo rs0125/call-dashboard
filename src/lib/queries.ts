@@ -420,6 +420,8 @@ export type CallFilters = {
   direction?: "inbound" | "outbound";
   status?: string;
   search?: string; // matches from/to number
+  dateFrom?: Date; // start_time >= this instant
+  dateUntil?: Date; // start_time < this instant (exclusive upper bound)
   sort?: CallSort;
   order?: SortOrder;
   page?: number;
@@ -435,7 +437,7 @@ type RawCallRow = {
   status: string | null;
   start_time: Date | null;
   conversation_duration: bigint | null;
-  recording_url: string | null;
+  recording_r2_key: string | null;
   has_transcript: boolean;
   from_emp_id: bigint | null;
   from_emp_name: string | null;
@@ -453,6 +455,10 @@ export async function getCalls(filters: CallFilters = {}) {
     conds.push(Prisma.sql`lower(c.direction) IN ('inbound','incoming')`);
   if (filters.direction === "outbound")
     conds.push(Prisma.sql`lower(c.direction) LIKE 'outbound%'`);
+  if (filters.dateFrom)
+    conds.push(Prisma.sql`c.start_time >= ${filters.dateFrom}`);
+  if (filters.dateUntil)
+    conds.push(Prisma.sql`c.start_time < ${filters.dateUntil}`);
   if (filters.search) {
     const like = `%${filters.search}%`;
     conds.push(
@@ -498,7 +504,8 @@ export async function getCalls(filters: CallFilters = {}) {
     prisma.$queryRaw<RawCallRow[]>`
       SELECT
         c.id, c.exotel_sid, c.from_number, c.to_number, c.direction, c.status,
-        c.start_time, c.conversation_duration, c.recording_url,
+        c.start_time, c.conversation_duration,
+        NULLIF(c.recording_r2_key, '') AS recording_r2_key,
         (c.transcript IS NOT NULL) AS has_transcript,
         ef.id AS from_emp_id, ef.name AS from_emp_name,
         et.id AS to_emp_id, et.name AS to_emp_name
@@ -525,7 +532,11 @@ export async function getCalls(filters: CallFilters = {}) {
       status: c.status,
       startTime: c.start_time,
       conversationDuration: n(c.conversation_duration),
-      recordingUrl: c.recording_url,
+      // Play via our own endpoint (presigned R2), not the auth-walled Exotel URL.
+      // Null until the Go service has archived the recording to R2.
+      recordingUrl: c.recording_r2_key
+        ? `/api/calls/${n(c.id)}/recording`
+        : null,
       hasTranscript: c.has_transcript,
       fromEmployee: c.from_emp_id
         ? { id: n(c.from_emp_id), name: c.from_emp_name }
@@ -539,16 +550,25 @@ export async function getCalls(filters: CallFilters = {}) {
 
 export type CallRow = Awaited<ReturnType<typeof getCalls>>["calls"][number];
 
-// Minimal employee list ({id, name}) for the calls-page filter dropdown — a
-// cheap indexed scan instead of the heavy per-employee aggregation. Lists ALL
-// employees (not just those with calls), so any agent can be filtered on.
+// Minimal employee list ({id, name}) for the calls-page filter dropdown. Only
+// lists employees attributed (by the AGENT leg, same rule as getCalls) to at
+// least one non-blocked call, so every option yields results when selected —
+// no empty dropdown entries. Cheap: one indexed pass over calls (DISTINCT on
+// the agent-leg employee), not the heavy per-employee aggregation.
 export async function getEmployeeOptions(): Promise<
   Array<{ id: number; name: string }>
 > {
-  const rows = await prisma.employees.findMany({
-    select: { id: true, name: true },
-    orderBy: { name: "asc" },
-  });
+  const rows = await prisma.$queryRaw<Array<{ id: bigint; name: string | null }>>`
+    SELECT DISTINCT e.id, e.name
+    FROM calls c
+    JOIN employee_numbers en ON en.phone_key = CASE
+      WHEN lower(c.direction) IN ('inbound','incoming') THEN ${TO_KEY}
+      WHEN lower(c.direction) LIKE 'outbound%'          THEN ${FROM_KEY}
+    END
+    JOIN employees e ON e.id = en.employee_id
+    WHERE TRUE ${blockedCallClause()}
+    ORDER BY e.name ASC
+  `;
   return rows.map((e) => ({ id: n(e.id), name: e.name ?? "(unnamed)" }));
 }
 
@@ -580,6 +600,18 @@ export type CallTranscript = {
   segments: TranscriptSegment[];
   transcribedAt: string | null;
 };
+
+// The R2 object key for a call's archived recording (set by the Go service's
+// archiver). Null/empty when the recording hasn't been archived to R2 yet.
+// GORM stores unset strings as '' rather than NULL, so treat '' as absent.
+export async function getRecordingKey(id: number): Promise<string | null> {
+  const row = await prisma.calls.findUnique({
+    where: { id },
+    select: { recording_r2_key: true },
+  });
+  const key = row?.recording_r2_key;
+  return key ? key : null;
+}
 
 // Fetches one call's stored transcript (written by the Go STT pipeline into the
 // calls.transcript jsonb). Returns null when the call has no transcript yet.

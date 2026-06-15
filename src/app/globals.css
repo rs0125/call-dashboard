@@ -1056,6 +1056,189 @@ select {
 .btn-icon:hover { text-decoration: underline; }
 .btn-icon svg { display: block; }
 
+/* Inline recording player (RecordingPlayer.tsx) */
+.rec-player {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.rec-player-wide { display: flex; width: 100%; }
+.rec-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: var(--stroke) solid var(--blue);
+  border-radius: 999px;
+  background: var(--blue);
+  color: var(--ivory);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.rec-btn:hover { background: var(--blue-soft); }
+.rec-btn:active { transform: translateY(1px); }
+.rec-bar {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 60px;
+  max-width: 150px;
+  height: 5px;
+  background: var(--line-soft);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.rec-player-wide .rec-bar { max-width: none; }
+.rec-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--blue);
+  border-radius: 999px;
+}
+.rec-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.72rem;
+  color: var(--slate);
+  white-space: nowrap;
+}
+.rec-spin {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(248, 246, 241, 0.4);
+  border-top-color: var(--ivory);
+  border-radius: 50%;
+  animation: rec-spin 0.7s linear infinite;
+}
+@keyframes rec-spin { to { transform: rotate(360deg); } }
+
+/* Calls filter bar (CallFilters.tsx) */
+.filters-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.85rem;
+  margin-bottom: 1rem;
+  border-bottom: var(--stroke) solid var(--line-soft);
+}
+.filters-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--blue);
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+.filters-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.2rem;
+  height: 1.2rem;
+  padding: 0 0.35rem;
+  background: var(--blue);
+  color: var(--ivory);
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+.filters-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: end;
+  gap: 1rem 1.25rem;
+}
+.filters-grid .field { margin-bottom: 0; }
+/* Date range gets its own full-width row under the four equal fields. */
+.field-daterange { grid-column: 1 / -1; }
+@media (max-width: 860px) {
+  .filters-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 480px) {
+  .filters-grid { grid-template-columns: 1fr; }
+}
+
+.input-icon { position: relative; display: flex; align-items: center; }
+.input-icon svg {
+  position: absolute;
+  left: 0.6rem;
+  color: var(--slate);
+  pointer-events: none;
+}
+.input-icon input { padding-left: 1.9rem; }
+.date-range {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+.date-field { display: flex; flex-direction: column; gap: 0.3rem; }
+.date-label {
+  margin: 0;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--slate);
+}
+.date-range input { width: 170px; min-width: 140px; }
+/* Push the quick presets to the far right of the date row for a balanced edge. */
+.date-range .preset-row { margin-left: auto; }
+.preset-row { display: flex; gap: 0.3rem; }
+.preset-btn {
+  padding: 0.3rem 0.55rem;
+  border: var(--stroke) solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--ivory);
+  color: var(--blue);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.preset-btn:hover { background: var(--hover-bg); }
+.preset-btn.on {
+  background: var(--blue);
+  color: var(--ivory);
+  border-color: var(--blue);
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: var(--stroke) solid var(--line-soft);
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.3rem 0.2rem 0.6rem;
+  background: var(--ivory-soft);
+  border: var(--stroke) solid var(--line-soft);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--charcoal);
+}
+.chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--slate);
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.chip button:hover { background: var(--hover-bg); color: var(--bad); }
+
 .conv-backdrop {
   position: fixed;
   inset: 0;

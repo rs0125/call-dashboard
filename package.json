@@ -11,6 +11,8 @@
     "db:generate": "prisma generate"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1068.0",
+    "@aws-sdk/s3-request-presigner": "^3.1068.0",
     "@prisma/client": "^6.3.1",
     "next": "^15.1.6",
     "react": "^19.0.0",
