@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getOverviewWindow, getDirectionStats } from "@/lib/queries";
+import { getCurrentUser } from "@/lib/auth";
 
 // One endpoint, fetched once by the overview, returning every time window
 // (current period + the matching previous period for "X yesterday / last
@@ -21,6 +22,11 @@ function istMidnight(now: Date, daysAgo = 0): Date {
 }
 
 export async function GET() {
+  // Layouts don't guard route handlers — enforce the session here too.
+  if (!(await getCurrentUser())) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
   const now = new Date();
   const todayMid = istMidnight(now);
 

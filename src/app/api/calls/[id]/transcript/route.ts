@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCallTranscript } from "@/lib/queries";
+import { getCurrentUser } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +11,11 @@ export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  // Layouts don't guard route handlers — enforce the session here too.
+  if (!(await getCurrentUser())) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
   const { id } = await params;
   const callId = Number(id);
   if (!Number.isFinite(callId)) {
