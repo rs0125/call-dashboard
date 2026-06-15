@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getOverviewWindow, getDirectionStats } from "@/lib/queries";
+import { getOverviewBundle, type OverviewPeriod } from "@/lib/queries";
 import { getCurrentUser } from "@/lib/auth";
 
 // One endpoint, fetched once by the overview, returning every time window
@@ -75,23 +75,44 @@ export async function GET() {
     },
   ] as const;
 
-  const data = await Promise.all(
-    windows.map(async (w) => {
-      const [window, previous] = await Promise.all([
-        getOverviewWindow(w.since),
-        w.prevSince
-          ? getDirectionStats(w.prevSince, w.prevUntil)
-          : Promise.resolve(null),
-      ]);
-      return {
-        key: w.key,
-        title: w.title,
-        prevLabel: w.prevLabel,
-        previous, // { inbound, outbound, totalCalls } | null
-        ...window,
-      };
-    }),
-  );
+  // Flatten every window into periods for the consolidated 2-query bundle:
+  // each current window + its previous-comparison period (keyed `<key>_prev`).
+  // Current windows get the per-employee breakdown; previous ones are summary
+  // only (isCurrent: false).
+  const periods: OverviewPeriod[] = [];
+  for (const w of windows) {
+    periods.push({ key: w.key, since: w.since ?? null, until: null, isCurrent: true });
+    if (w.prevSince) {
+      periods.push({
+        key: `${w.key}_prev`,
+        since: w.prevSince,
+        until: w.prevUntil,
+        isCurrent: false,
+      });
+    }
+  }
+
+  const bundle = await getOverviewBundle(periods);
+
+  const data = windows.map((w) => {
+    const cur = bundle[w.key];
+    const prev = w.prevSince ? bundle[`${w.key}_prev`] : null;
+    return {
+      key: w.key,
+      title: w.title,
+      prevLabel: w.prevLabel,
+      previous: prev
+        ? { inbound: prev.inbound, outbound: prev.outbound }
+        : null,
+      overview: {
+        inbound: cur.inbound,
+        outbound: cur.outbound,
+        totalCalls: cur.totalCalls,
+        unmatchedCalls: cur.unmatchedCalls,
+      },
+      employees: cur.employees,
+    };
+  });
 
   return NextResponse.json({ windows: data });
 }

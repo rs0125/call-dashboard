@@ -183,73 +183,6 @@ export type DirectionStats = {
   talkSeconds: number;
 };
 
-export type DirectionSummary = {
-  inbound: DirectionStats;
-  outbound: DirectionStats;
-  totalCalls: number;
-};
-
-// Company-level call stats bucketed by direction, over an optional
-// [since, until) window. Used for both a window's current period and its
-// preceding period (for the "X yesterday / last week / …" comparisons).
-export async function getDirectionStats(
-  since?: Date,
-  until?: Date,
-): Promise<DirectionSummary> {
-  const conds: Prisma.Sql[] = [];
-  if (since) conds.push(Prisma.sql`start_time >= ${since}`);
-  if (until) conds.push(Prisma.sql`start_time < ${until}`);
-  const blocked = blockedCallExpr();
-  if (blocked) conds.push(blocked);
-  const where =
-    conds.length > 0
-      ? Prisma.sql`WHERE ${Prisma.join(conds, " AND ")}`
-      : Prisma.empty;
-
-  const buckets = await prisma.$queryRaw<
-    Array<{
-      bucket: string;
-      total: bigint;
-      answered: bigint;
-      missed: bigint;
-      talk_seconds: bigint;
-    }>
-  >`
-    SELECT
-      CASE
-        WHEN lower(direction) IN ('inbound','incoming') THEN 'inbound'
-        WHEN lower(direction) LIKE 'outbound%'          THEN 'outbound'
-        ELSE 'other'
-      END AS bucket,
-      COUNT(*)                                                                   AS total,
-      COUNT(*) FILTER (WHERE lower(status) IN ('completed','in-progress','in-call')) AS answered,
-      COUNT(*) FILTER (WHERE lower(status) IN ('no-answer','missed','busy','failed')) AS missed,
-      COALESCE(SUM(conversation_duration), 0)                                    AS talk_seconds
-    FROM calls c
-    ${where}
-    GROUP BY bucket
-  `;
-
-  const empty: DirectionStats = { total: 0, answered: 0, missed: 0, talkSeconds: 0 };
-  const pick = (bucket: string): DirectionStats => {
-    const r = buckets.find((b) => b.bucket === bucket);
-    return r
-      ? {
-          total: n(r.total),
-          answered: n(r.answered),
-          missed: n(r.missed),
-          talkSeconds: n(r.talk_seconds),
-        }
-      : { ...empty };
-  };
-
-  return {
-    inbound: pick("inbound"),
-    outbound: pick("outbound"),
-    totalCalls: buckets.reduce((s, b) => s + n(b.total), 0),
-  };
-}
-
 export type Overview = {
   inbound: DirectionStats;
   outbound: DirectionStats;
@@ -257,46 +190,207 @@ export type Overview = {
   unmatchedCalls: number; // no employee on either leg
 };
 
-export async function getOverview(since?: Date): Promise<Overview> {
-  const unmatchedSince = since
-    ? Prisma.sql`AND c.start_time >= ${since}`
-    : Prisma.empty;
-
-  const [dir, unmatched] = await Promise.all([
-    getDirectionStats(since),
-    prisma.$queryRaw<Array<{ n: bigint }>>`
-      SELECT COUNT(*) AS n
-      FROM calls c
-      WHERE NOT EXISTS (
-        SELECT 1 FROM employee_numbers en
-        WHERE en.phone_key = ${FROM_KEY} OR en.phone_key = ${TO_KEY}
-      )
-      ${unmatchedSince}
-      ${blockedCallClause()}
-    `,
-  ]);
-
-  return {
-    inbound: dir.inbound,
-    outbound: dir.outbound,
-    totalCalls: dir.totalCalls,
-    unmatchedCalls: n(unmatched[0]?.n ?? 0),
-  };
-}
-
+// One time-window's data for the overview: company direction summary +
+// per-employee breakdown.
 export type OverviewWindow = {
-  overview: Overview;
+  inbound: DirectionStats;
+  outbound: DirectionStats;
+  totalCalls: number;
+  unmatchedCalls: number;
   employees: EmployeeStat[];
 };
 
-// Everything one time-window section needs: direction summary + per-employee
-// breakdown, both scoped to `since` (undefined = all time).
-export async function getOverviewWindow(since?: Date): Promise<OverviewWindow> {
-  const [overview, employees] = await Promise.all([
-    getOverview(since),
-    getEmployeeStats({ since }),
-  ]);
-  return { overview, employees };
+// A time window the bundle should compute. [since, until) — null = unbounded on
+// that end (e.g. "all time" = both null; "today" = since set, until null).
+// isCurrent windows get the per-employee breakdown; previous-period windows
+// (the "X yesterday / last week" comparisons) only need the direction summary.
+export type OverviewPeriod = {
+  key: string;
+  since: Date | null;
+  until: Date | null;
+  isCurrent: boolean;
+};
+
+// Builds a SQL `VALUES (key, since, until), …` fragment for a CROSS JOIN LATERAL.
+// Casting each timestamp param to timestamptz lets NULLs (unbounded ends)
+// coexist with real bounds in the same column.
+function periodValues(periods: OverviewPeriod[]): Prisma.Sql {
+  return Prisma.join(
+    periods.map(
+      (p) =>
+        Prisma.sql`(${p.key}, ${p.since}::timestamptz, ${p.until}::timestamptz)`,
+    ),
+    ", ",
+  );
+}
+
+// THE overview query path — replaces the old per-window fan-out (~19 serial
+// queries) with exactly TWO set-based queries, so the endpoint is robust even
+// at connection_limit=1 (the Vercel/Supabase pooler default that was causing
+// P2024 connection-pool timeouts). Each call is paired with every window it
+// falls into via a VALUES lateral, then aggregated by window key in one pass.
+//
+//   Query A: company direction stats + unmatched, for ALL periods (current +
+//            previous), bucketed inbound/outbound.
+//   Query B: per-employee per-direction stats, for the CURRENT windows only
+//            (agent-leg attribution, identical rule to getEmployeeStats).
+export async function getOverviewBundle(
+  periods: OverviewPeriod[],
+): Promise<Record<string, OverviewWindow>> {
+  const current = periods.filter((p) => p.isCurrent);
+
+  // --- Query A: company-level direction + unmatched, all periods at once. ---
+  const rowsA = await prisma.$queryRaw<
+    Array<{
+      window_key: string;
+      bucket: string;
+      total: bigint;
+      answered: bigint;
+      missed: bigint;
+      talk_seconds: bigint;
+      unmatched: bigint;
+    }>
+  >`
+    SELECT
+      w.key AS window_key,
+      CASE
+        WHEN lower(c.direction) IN ('inbound','incoming') THEN 'inbound'
+        WHEN lower(c.direction) LIKE 'outbound%'          THEN 'outbound'
+        ELSE 'other'
+      END AS bucket,
+      COUNT(*)                                                                   AS total,
+      COUNT(*) FILTER (WHERE lower(c.status) IN ('completed','in-progress','in-call')) AS answered,
+      COUNT(*) FILTER (WHERE lower(c.status) IN ('no-answer','missed','busy','failed')) AS missed,
+      COALESCE(SUM(c.conversation_duration), 0)                                  AS talk_seconds,
+      COUNT(*) FILTER (WHERE NOT EXISTS (
+        SELECT 1 FROM employee_numbers en
+        WHERE en.phone_key = ${FROM_KEY} OR en.phone_key = ${TO_KEY}
+      ))                                                                         AS unmatched
+    FROM calls c
+    CROSS JOIN LATERAL (VALUES ${periodValues(periods)}) AS w(key, since, until)
+    WHERE (w.since IS NULL OR c.start_time >= w.since)
+      AND (w.until IS NULL OR c.start_time <  w.until)
+      ${blockedCallClause()}
+    GROUP BY w.key, bucket
+  `;
+
+  // --- Query B: per-employee per-direction, current windows only. ---
+  const rowsB =
+    current.length === 0
+      ? []
+      : await prisma.$queryRaw<
+          Array<{
+            id: bigint;
+            name: string | null;
+            email: string | null;
+            is_active: boolean;
+            phone_number: string | null;
+            window_key: string;
+            in_total: bigint;
+            in_answered: bigint;
+            in_talk: bigint;
+            out_total: bigint;
+            out_answered: bigint;
+            out_talk: bigint;
+            last_call_at: Date | null;
+          }>
+        >`
+    SELECT
+      e.id, e.name, e.email, e.is_active,
+      (SELECT phone_number FROM employee_numbers
+        WHERE employee_id = e.id AND is_primary LIMIT 1)                          AS phone_number,
+      w.key AS window_key,
+      COUNT(*) FILTER (WHERE c.dir_in)                                            AS in_total,
+      COUNT(*) FILTER (WHERE c.dir_in AND lower(c.status) IN ('completed','in-progress','in-call'))  AS in_answered,
+      COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_in), 0)           AS in_talk,
+      COUNT(*) FILTER (WHERE c.dir_out)                                           AS out_total,
+      COUNT(*) FILTER (WHERE c.dir_out AND lower(c.status) IN ('completed','in-progress','in-call')) AS out_answered,
+      COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_out), 0)          AS out_talk,
+      MAX(c.start_time)                                                           AS last_call_at
+    FROM employees e
+    JOIN LATERAL (
+      SELECT
+        c.status, c.conversation_duration, c.start_time,
+        lower(c.direction) IN ('inbound','incoming') AS dir_in,
+        lower(c.direction) LIKE 'outbound%'          AS dir_out
+      FROM calls c
+      WHERE (
+              (lower(c.direction) IN ('inbound','incoming')
+               AND ${TO_KEY}   IN (SELECT phone_key FROM employee_numbers WHERE employee_id = e.id))
+           OR (lower(c.direction) LIKE 'outbound%'
+               AND ${FROM_KEY} IN (SELECT phone_key FROM employee_numbers WHERE employee_id = e.id))
+            )
+            ${blockedCallClause()}
+    ) c ON true
+    CROSS JOIN LATERAL (VALUES ${periodValues(current)}) AS w(key, since, until)
+    WHERE (w.since IS NULL OR c.start_time >= w.since)
+      AND (w.until IS NULL OR c.start_time <  w.until)
+    GROUP BY e.id, w.key
+  `;
+
+  // Assemble: one OverviewWindow per period key.
+  const result: Record<string, OverviewWindow> = {};
+  const empty: DirectionStats = { total: 0, answered: 0, missed: 0, talkSeconds: 0 };
+  for (const p of periods) {
+    result[p.key] = {
+      inbound: { ...empty },
+      outbound: { ...empty },
+      totalCalls: 0,
+      unmatchedCalls: 0,
+      employees: [],
+    };
+  }
+
+  for (const r of rowsA) {
+    const win = result[r.window_key];
+    if (!win) continue;
+    win.totalCalls += n(r.total);
+    win.unmatchedCalls += n(r.unmatched);
+    const stats: DirectionStats = {
+      total: n(r.total),
+      answered: n(r.answered),
+      missed: n(r.missed),
+      talkSeconds: n(r.talk_seconds),
+    };
+    if (r.bucket === "inbound") win.inbound = stats;
+    else if (r.bucket === "outbound") win.outbound = stats;
+    // 'other' contributes to totalCalls/unmatched only (no column rendered).
+  }
+
+  for (const r of rowsB) {
+    const win = result[r.window_key];
+    if (!win) continue;
+    win.employees.push({
+      id: n(r.id),
+      name: r.name ?? "(unnamed)",
+      phoneNumber: r.phone_number ?? "—",
+      email: r.email,
+      active: r.is_active,
+      totalCalls: n(r.in_total) + n(r.out_total),
+      answered: n(r.in_answered) + n(r.out_answered),
+      talkSeconds: n(r.in_talk) + n(r.out_talk),
+      lastCallAt: r.last_call_at,
+      inbound: {
+        total: n(r.in_total),
+        answered: n(r.in_answered),
+        talkSeconds: n(r.in_talk),
+      },
+      outbound: {
+        total: n(r.out_total),
+        answered: n(r.out_answered),
+        talkSeconds: n(r.out_talk),
+      },
+    });
+  }
+
+  // Stable order within each window (the per-direction tables re-sort anyway).
+  for (const win of Object.values(result)) {
+    win.employees.sort(
+      (a, b) => b.totalCalls - a.totalCalls || a.name.localeCompare(b.name),
+    );
+  }
+
+  return result;
 }
 
 export const CALL_SORTS = [
