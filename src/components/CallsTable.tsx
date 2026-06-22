@@ -111,7 +111,10 @@ export function CallsTable({
                 {fmtDateTime(c.startTime)}
               </td>
               <td>
-                <StatusBadge status={c.status} />
+                <StatusBadge
+                  status={c.status}
+                  conversationDuration={c.conversationDuration}
+                />
               </td>
               <td className="num">{fmtDuration(c.conversationDuration)}</td>
               <td>

@@ -78,6 +78,18 @@ function DirectionColumn({
   const hist = (v: string | number) =>
     prev && prevLabel ? `${v} ${prevLabel}` : undefined;
 
+  // Distinct not-answered outcomes. Show a card when the bucket is non-zero in
+  // either the current or the previous period (so the comparison line stays
+  // meaningful); always keep "No answer" since it's the headline failure.
+  const outcomes = [
+    { label: "No answer", key: "noAnswer" as const, always: true },
+    { label: "Busy", key: "busy" as const, always: false },
+    { label: "Failed", key: "failed" as const, always: false },
+    { label: "Canceled", key: "canceled" as const, always: false },
+  ].filter(
+    (o) => o.always || stats[o.key] > 0 || (prev ? prev[o.key] > 0 : false),
+  );
+
   // Employees active in this direction, busiest first.
   const rows = employees
     .filter((e) => e[dir].total > 0)
@@ -92,7 +104,7 @@ function DirectionColumn({
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(2, 1fr)",
+          gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
           gap: "0.75rem",
           marginBottom: "1rem",
         }}
@@ -109,12 +121,15 @@ function DirectionColumn({
           hist={hist(prev ? prev.answered.toLocaleString() : "")}
           tone="approved"
         />
-        <StatCard
-          label="No answer"
-          value={stats.missed.toLocaleString()}
-          hist={hist(prev ? prev.missed.toLocaleString() : "")}
-          tone={stats.missed > 0 ? "pending" : undefined}
-        />
+        {outcomes.map((o) => (
+          <StatCard
+            key={o.key}
+            label={o.label}
+            value={stats[o.key].toLocaleString()}
+            hist={hist(prev ? prev[o.key].toLocaleString() : "")}
+            tone={stats[o.key] > 0 ? "pending" : undefined}
+          />
+        ))}
         <StatCard
           label="Talk time"
           value={fmtDuration(stats.talkSeconds)}

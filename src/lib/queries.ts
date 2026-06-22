@@ -13,6 +13,37 @@ const n = (v: bigint | number | null | Prisma.Decimal | string): number =>
 const FROM_KEY = Prisma.sql`right(regexp_replace(coalesce(c.from_number, ''), '[^0-9]', '', 'g'), 10)`;
 const TO_KEY = Prisma.sql`right(regexp_replace(coalesce(c.to_number, ''), '[^0-9]', '', 'g'), 10)`;
 
+// A call counts as ANSWERED iff it logged conversation time. This is the single
+// source of truth for answered/missed, robust across both directions.
+//
+// We do NOT use the parent `status` here: Exotel marks EVERY inbound parent leg
+// 'completed' the moment the call reaches the exophone/flow, even when the agent
+// never picks up (no-answer, busy, or the caller hangs up during ringing). Those
+// unanswered inbound calls all log conversation_duration = 0, while genuinely
+// connected calls log > 0. (Outbound status agrees with this too, so the same
+// rule is correct for both.) Each query aliases the call row as `c`.
+const ANSWERED = Prisma.sql`coalesce(c.conversation_duration, 0) > 0`;
+const NOT_ANSWERED = Prisma.sql`coalesce(c.conversation_duration, 0) = 0`;
+
+// The outcome reason for a call that did NOT connect lives in different places
+// per direction: OUTBOUND carries it on the parent `status` (no-answer / busy /
+// failed), while INBOUND parent status is always 'completed', so the agent leg
+// (leg2_status) holds the real reason (no-answer / canceled / busy). An empty/
+// unknown agent leg (call never reached an agent) falls through to "no answer".
+// Lowercased; '' when truly unknown. Each query aliases the call row as `c`.
+const EFF_STATUS = Prisma.sql`lower(coalesce(
+  CASE WHEN lower(c.direction) IN ('inbound','incoming')
+       THEN nullif(c.leg2_status, '')
+       ELSE c.status END, ''))`;
+
+// Per-bucket count fragments over the NOT-answered calls, by effective status.
+// no_answer is the catch-all (no-answer / missed / empty / anything unmapped) so
+// busy + failed + canceled + no_answer == (total - answered) for any direction.
+const CNT_BUSY = Prisma.sql`COUNT(*) FILTER (WHERE ${NOT_ANSWERED} AND ${EFF_STATUS} = 'busy')`;
+const CNT_FAILED = Prisma.sql`COUNT(*) FILTER (WHERE ${NOT_ANSWERED} AND ${EFF_STATUS} = 'failed')`;
+const CNT_CANCELED = Prisma.sql`COUNT(*) FILTER (WHERE ${NOT_ANSWERED} AND ${EFF_STATUS} = 'canceled')`;
+const CNT_NO_ANSWER = Prisma.sql`COUNT(*) FILTER (WHERE ${NOT_ANSWERED} AND ${EFF_STATUS} NOT IN ('busy','failed','canceled'))`;
+
 // Dashboard blocklist: calls touching these employees (matched by email, so it
 // survives number changes) are hidden from every call view — used to suppress
 // internal test traffic (e.g. Raghav's own line). Configured via
@@ -122,14 +153,14 @@ export async function getEmployeeStats(
       (SELECT phone_number FROM employee_numbers
         WHERE employee_id = e.id AND is_primary LIMIT 1)                          AS phone_number,
       COUNT(c.id)                                                                  AS total_calls,
-      COUNT(*) FILTER (WHERE lower(c.status) IN ('completed','in-progress','in-call')) AS answered,
+      COUNT(*) FILTER (WHERE ${ANSWERED})                                          AS answered,
       COALESCE(SUM(c.conversation_duration), 0)                                    AS talk_seconds,
       MAX(c.start_time)                                                            AS last_call_at,
       COUNT(*) FILTER (WHERE c.dir_in)                                             AS in_total,
-      COUNT(*) FILTER (WHERE c.dir_in AND lower(c.status) IN ('completed','in-progress','in-call')) AS in_answered,
+      COUNT(*) FILTER (WHERE c.dir_in AND ${ANSWERED})                             AS in_answered,
       COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_in), 0)            AS in_talk,
       COUNT(*) FILTER (WHERE c.dir_out)                                            AS out_total,
-      COUNT(*) FILTER (WHERE c.dir_out AND lower(c.status) IN ('completed','in-progress','in-call')) AS out_answered,
+      COUNT(*) FILTER (WHERE c.dir_out AND ${ANSWERED})                            AS out_answered,
       COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_out), 0)           AS out_talk
     FROM employees e
     LEFT JOIN LATERAL (
@@ -179,7 +210,11 @@ export async function getEmployeeStats(
 export type DirectionStats = {
   total: number;
   answered: number;
-  missed: number;
+  // Distinct not-answered outcomes. They sum to (total - answered).
+  noAnswer: number; // rang but nobody picked up (+ unknown/abandoned-in-flow)
+  busy: number; // line busy
+  failed: number; // telephony failure (couldn't place/connect the call)
+  canceled: number; // caller hung up before the agent connected
   talkSeconds: number;
 };
 
@@ -246,7 +281,10 @@ export async function getOverviewBundle(
       bucket: string;
       total: bigint;
       answered: bigint;
-      missed: bigint;
+      no_answer: bigint;
+      busy: bigint;
+      failed: bigint;
+      canceled: bigint;
       talk_seconds: bigint;
       unmatched: bigint;
     }>
@@ -259,8 +297,11 @@ export async function getOverviewBundle(
         ELSE 'other'
       END AS bucket,
       COUNT(*)                                                                   AS total,
-      COUNT(*) FILTER (WHERE lower(c.status) IN ('completed','in-progress','in-call')) AS answered,
-      COUNT(*) FILTER (WHERE lower(c.status) IN ('no-answer','missed','busy','failed')) AS missed,
+      COUNT(*) FILTER (WHERE ${ANSWERED})                                         AS answered,
+      ${CNT_NO_ANSWER}                                                            AS no_answer,
+      ${CNT_BUSY}                                                                 AS busy,
+      ${CNT_FAILED}                                                               AS failed,
+      ${CNT_CANCELED}                                                             AS canceled,
       COALESCE(SUM(c.conversation_duration), 0)                                  AS talk_seconds,
       COUNT(*) FILTER (WHERE NOT EXISTS (
         SELECT 1 FROM employee_numbers en
@@ -301,10 +342,10 @@ export async function getOverviewBundle(
         WHERE employee_id = e.id AND is_primary LIMIT 1)                          AS phone_number,
       w.key AS window_key,
       COUNT(*) FILTER (WHERE c.dir_in)                                            AS in_total,
-      COUNT(*) FILTER (WHERE c.dir_in AND lower(c.status) IN ('completed','in-progress','in-call'))  AS in_answered,
+      COUNT(*) FILTER (WHERE c.dir_in AND ${ANSWERED})                             AS in_answered,
       COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_in), 0)           AS in_talk,
       COUNT(*) FILTER (WHERE c.dir_out)                                           AS out_total,
-      COUNT(*) FILTER (WHERE c.dir_out AND lower(c.status) IN ('completed','in-progress','in-call')) AS out_answered,
+      COUNT(*) FILTER (WHERE c.dir_out AND ${ANSWERED})                            AS out_answered,
       COALESCE(SUM(c.conversation_duration) FILTER (WHERE c.dir_out), 0)          AS out_talk,
       MAX(c.start_time)                                                           AS last_call_at
     FROM employees e
@@ -330,7 +371,15 @@ export async function getOverviewBundle(
 
   // Assemble: one OverviewWindow per period key.
   const result: Record<string, OverviewWindow> = {};
-  const empty: DirectionStats = { total: 0, answered: 0, missed: 0, talkSeconds: 0 };
+  const empty: DirectionStats = {
+    total: 0,
+    answered: 0,
+    noAnswer: 0,
+    busy: 0,
+    failed: 0,
+    canceled: 0,
+    talkSeconds: 0,
+  };
   for (const p of periods) {
     result[p.key] = {
       inbound: { ...empty },
@@ -349,7 +398,10 @@ export async function getOverviewBundle(
     const stats: DirectionStats = {
       total: n(r.total),
       answered: n(r.answered),
-      missed: n(r.missed),
+      noAnswer: n(r.no_answer),
+      busy: n(r.busy),
+      failed: n(r.failed),
+      canceled: n(r.canceled),
       talkSeconds: n(r.talk_seconds),
     };
     if (r.bucket === "inbound") win.inbound = stats;

@@ -21,17 +21,46 @@ export function fmtDateTime(d: Date | null | undefined): string {
   }).format(d);
 }
 
-// Exotel call statuses we treat as a connected/answered conversation.
-const ANSWERED = new Set(["completed", "in-progress", "in-call"]);
-
-export function isAnswered(status: string | null | undefined): boolean {
-  return ANSWERED.has((status ?? "").toLowerCase());
+// A call was actually answered iff it logged conversation time. We rely on talk
+// time rather than `status` because Exotel marks every INBOUND parent leg
+// 'completed' the moment the call reaches the exophone/flow — even when the
+// agent never picks up (no-answer / busy / caller hangs up while ringing). Those
+// unanswered calls log conversation_duration = 0. (Mirrors `ANSWERED` in
+// queries.ts, the source of truth for the stats.)
+export function isConnected(
+  conversationDuration: number | bigint | null | undefined,
+): boolean {
+  return Number(conversationDuration ?? 0) > 0;
 }
 
-// Maps an Exotel call status to one of the portal's semantic badge variants.
-export function statusBadgeClass(status: string | null | undefined): string {
+// User-facing outcome for a single call row. A 'completed' call that never
+// connected (no talk time) is really a missed/"no answer" call — show that
+// instead of the misleading 'completed' the Exotel parent leg reports.
+export function callOutcomeLabel(
+  status: string | null | undefined,
+  conversationDuration: number | bigint | null | undefined,
+): string {
   const s = (status ?? "").toLowerCase();
-  if (isAnswered(s)) return "badge badge-approved";
+  if (s === "completed" && !isConnected(conversationDuration)) return "no answer";
+  return status ?? "—";
+}
+
+// Maps a call to one of the portal's semantic badge variants. When talk time is
+// provided it drives the verdict (answered = green); otherwise we fall back to
+// the raw status string.
+export function statusBadgeClass(
+  status: string | null | undefined,
+  conversationDuration?: number | bigint | null,
+): string {
+  const s = (status ?? "").toLowerCase();
+  if (conversationDuration !== undefined) {
+    if (isConnected(conversationDuration)) return "badge badge-approved";
+    if (s === "failed" || s === "canceled") return "badge badge-rejected";
+    // completed-but-no-talk, no-answer, missed, busy, … → not answered.
+    return "badge badge-pending";
+  }
+  if (s === "completed" || s === "in-progress" || s === "in-call")
+    return "badge badge-approved";
   if (s === "no-answer" || s === "missed" || s === "busy")
     return "badge badge-pending";
   if (s === "failed" || s === "canceled") return "badge badge-rejected";
